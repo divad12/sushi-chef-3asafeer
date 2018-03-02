@@ -23,6 +23,7 @@ from ricecooker.classes import nodes, files, licenses
 from ricecooker.utils.caching import CacheForeverHeuristic, FileCache, CacheControlAdapter, InvalidatingCacheControlAdapter
 from ricecooker.utils.browser import preview_in_browser
 from ricecooker.utils.html import download_file, WebDriver
+from ricecooker.utils.downloader import download_static_assets
 from ricecooker.utils.zip import create_predictable_zip
 import selenium.webdriver.support.ui as selenium_ui
 from distutils.dir_util import copy_tree
@@ -138,6 +139,20 @@ def download_single(i):
         return process_node_from_doc(doc, book_id, title, thumbnail)
 
 
+url_blacklist = [
+    'google-analytics.com/analytics.js',
+    'fbds.js',
+    'chimpstatic.com',
+    'jquery.fancybox.pack.js',
+]
+
+IMAGES_IN_JS_RE = re.compile(r"images/(.*?)['\")]")
+
+
+def is_blacklisted(url):
+    return any((item in url.lower()) for item in url_blacklist)
+
+
 def process_node_from_doc(doc, book_id, title, thumbnail):
     """Extract a Ricecooker node given the HTML source and some metadata."""
     # Create a temporary folder to download all the files for a book.
@@ -155,9 +170,39 @@ def process_node_from_doc(doc, book_id, title, thumbnail):
         if not thumbnail.lower().endswith(thumbnail_extensions):
             thumbnail = None
 
+    def js_middleware(content, url, **kwargs):
+        for img in IMAGES_IN_JS_RE.findall(content):
+            url = make_fully_qualified_url('/images/%s' % img)
+            if is_blacklisted(url):
+                print('        Skipping downloading blacklisted url', url)
+                continue
+            print("        Downloading", url, "to filename", img)
+            download_file(url, destination, subpath="images",
+                    request_fn=make_request, filename=img)
+
+        return content
+
     # Download all the JS/CSS/images/audio/etc. we'll need to make a standalone
     # app.
-    doc = download_static_assets(doc, destination)
+    doc = download_static_assets(doc, destination, 'http://3asafeer.com',
+            request_fn=make_request, url_blacklist=url_blacklist,
+            js_middleware=js_middleware)
+
+    # Copy over some of our own JS/CSS files and then add links to them in the
+    # page source.
+    copy_tree("static", os.path.join(destination, "static"))
+
+    chef_head_script = doc.new_tag("script", src="static/chef_end_of_head.js")
+    doc.select_one('head').append(chef_head_script)
+
+    jquery_fancybox = doc.new_tag("script", src="static/jquery.fancybox.dummy.js")
+    doc.select_one('head').append(jquery_fancybox)
+
+    chef_body_script = doc.new_tag("script", src="static/chef_end_of_body.js")
+    doc.select_one('body').append(chef_body_script)
+
+    chef_css = doc.new_tag("link", href="static/chef.css", rel="stylesheet")
+    doc.select_one('head').append(chef_css)
 
     # Remove a bunch of HTML that we don't want showing in our standalone app.
     doc.select_one('base')['href'] = ''
@@ -175,7 +220,7 @@ def process_node_from_doc(doc, book_id, title, thumbnail):
 
     print("Downloaded book %s titled \"%s\" (thumbnail %s) to destination %s" % (
         book_id, title, thumbnail, destination))
-    #preview_in_browser(destination)
+    preview_in_browser(destination)
 
     zip_path = create_predictable_zip(destination)
     return nodes.HTML5AppNode(
@@ -201,136 +246,11 @@ def truncate_metadata(data_string):
     return data_string
 
 
-CSS_URL_RE = re.compile(r"url\(['\"]?(.*?)['\"]?\)")
-IMAGES_IN_JS_RE = re.compile(r"images/(.*?)['\")]")
-
-
-def download_static_assets(doc, destination):
-    """Download all the static assets for a given book's HTML soup.
-
-    Will download JS, CSS, images, and audio clips.
-    """
-    # Helper function to download all assets for a given CSS selector.
-    def download_assets(selector, attr, url_middleware=None,
-            content_middleware=None, node_filter=None):
-        nodes = doc.select(selector)
-
-        for i, node in enumerate(nodes):
-
-            if node_filter:
-                if not node_filter(node):
-                    src = node[attr]
-                    node[attr] = ''
-                    print('Skipping node with src ', src)
-                    continue
-
-            url = make_fully_qualified_url(node[attr])
-
-            if is_blacklisted(url):
-                print('Skipping downloading blacklisted url', url)
-                node[attr] = ""
-                continue
-
-            if 'jquery.fancybox.pack.js' in url:
-                node[attr] = "static/jquery.fancybox.dummy.js"
-                continue
-
-            if url_middleware:
-                url = url_middleware(url)
-
-            filename = derive_filename(url)
-            node[attr] = filename
-
-            print("Downloading", url, "to filename", filename)
-            download_file(url, destination, request_fn=make_request,
-                    filename=filename, middleware_callbacks=content_middleware)
-
-    def js_middleware(content, url, **kwargs):
-        # Download all images referenced in JS files
-        for img in IMAGES_IN_JS_RE.findall(content):
-            url = make_fully_qualified_url('/images/%s' % img)
-            print("Downloading", url, "to filename", img)
-            download_file(url, destination, subpath="images",
-                    request_fn=make_request, filename=img)
-
-        # Polyfill localStorage and document.cookie as iframes can't access
-        # them
-        return (content
-            .replace("localStorage", "_localStorage")
-            .replace('document.cookie.split', '"".split')
-            .replace('document.cookie', 'window._document_cookie'))
-
-    def css_url_middleware(url):
-        # Somehow the minified app CSS doesn't render images. Download the
-        # original.
-        return url.replace("app.min.css", "app.css")
-
-    def css_node_filter(node):
-        return "stylesheet" in node["rel"]
-
-    def css_content_middleware(content, url, **kwargs):
-        # Download linked fonts and images
-        def repl(match):
-            src = match.group(1)
-            if src.startswith('//localhost'):
-                return 'src()'
-            # Don't download data: files
-            if src.startswith('data:'):
-                return match.group(0)
-            src_url = make_fully_qualified_url(src)
-            derived_filename = derive_filename(src_url)
-            download_file(src_url, destination, request_fn=make_request,
-                    filename=derived_filename)
-            return 'src("%s")' % derived_filename
-
-        return CSS_URL_RE.sub(repl, content)
-
-    # Download all linked static assets.
-    download_assets("img[src]", "src")  # Images
-    download_assets("link[href]", "href", url_middleware=css_url_middleware,
-            content_middleware=css_content_middleware,
-            node_filter=css_node_filter)  # CSS
-    download_assets("script[src]", "src", content_middleware=js_middleware) # JS
-    download_assets("source[src]", "src") # Audio
-    download_assets("source[srcset]", "srcset") # Audio
-
-    # ... and also run the middleware on CSS/JS embedded in the page source to
-    # get linked files.
-    for node in doc.select('style'):
-        node.string = css_content_middleware(node.get_text(), url='')
-
-    for node in doc.select('script'):
-        if not node.attrs.get('src'):
-            node.string = js_middleware(node.get_text(), url='')
-
-    # Copy over some of our own JS/CSS files and then add links to them in the
-    # page source.
-    copy_tree("static", os.path.join(destination, "static"))
-
-    chef_head_script = doc.new_tag("script", src="static/chef_end_of_head.js")
-    doc.select_one('head').append(chef_head_script)
-
-    chef_body_script = doc.new_tag("script", src="static/chef_end_of_body.js")
-    doc.select_one('body').append(chef_body_script)
-
-    chef_css = doc.new_tag("link", href="static/chef.css", rel="stylesheet")
-    doc.select_one('head').append(chef_css)
-
-    return doc
-
-
 url_blacklist = [
     'google-analytics.com/analytics.js',
     'fbds.js',
     'chimpstatic.com',
 ]
-
-def is_blacklisted(url):
-    return any((item in url) for item in url_blacklist)
-
-
-def derive_filename(url):
-    return "%s.%s" % (uuid.uuid4().hex, os.path.basename(urlparse(url).path))
 
 
 def make_request(url, clear_cookies=True, timeout=60, *args, **kwargs):
